@@ -330,6 +330,10 @@ async def monitor_addresses(addresses: List[str]) -> None:
         listener.stop()
     if stopped_by_escape:
         print("\nEsc pressed. Stopping monitoring. Goodbye!")
+        try:
+            input("Press Enter to exit...")
+        except EOFError:
+            pass
 
 
 def main() -> None:
