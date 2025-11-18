@@ -20,6 +20,7 @@ COLOR_RESET = "\033[0m"
 COLOR_GREEN = "\033[92m"
 COLOR_RED = "\033[91m"
 COLOR_YELLOW = "\033[93m"
+COLOR_CYAN = "\033[96m"
 CLEAR_SCREEN = "\033[2J\033[H"
 CURSOR_HOME = "\033[H"
 
@@ -144,7 +145,8 @@ def prompt_addresses() -> List[str]:
 
 def prompt_addresses_manual() -> List[str]:
     addresses: List[str] = []
-    print("Enter up to 20 IP addresses or FQDNs. Type 'end' when finished.")
+    end_word = colorize_text("'end'", COLOR_CYAN)
+    print(f"Enter up to 20 IP addresses or FQDNs. Type {end_word} when finished.")
     while len(addresses) < MAX_TARGETS:
         raw = input(f"Target {len(addresses) + 1}: ").strip()
         if not raw:
