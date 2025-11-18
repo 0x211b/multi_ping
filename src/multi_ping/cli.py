@@ -21,6 +21,7 @@ COLOR_GREEN = "\033[92m"
 COLOR_RED = "\033[91m"
 COLOR_YELLOW = "\033[93m"
 CLEAR_SCREEN = "\033[2J\033[H"
+CURSOR_HOME = "\033[H"
 
 
 @dataclass
@@ -274,14 +275,15 @@ def colorize_text(text: str, color: str) -> str:
     return f"{color}{text}{COLOR_RESET}"
 
 
-def display_results(stats: List[PingStats]) -> None:
+def display_results(stats: List[PingStats], *, initial: bool = False) -> None:
     indent = " " * 5
     header = f"{indent}{'Address':<35}{'Sent/Recv':<12}{'Success %':<12}{'Latency (ms)':<14}"
-    print(CLEAR_SCREEN, end="")
-    print(f"{indent}Press 'Esc' to exit monitoring.")
-    print()
-    print(header)
-    print(indent + "-" * (len(header) - len(indent)))
+    buffer: List[str] = []
+    if sys.stdout.isatty():
+        buffer.append(CLEAR_SCREEN if initial else CURSOR_HOME)
+    buffer.append(f"{indent}Press 'Esc' to exit monitoring.\n\n")
+    buffer.append(header + "\n")
+    buffer.append(indent + "-" * (len(header) - len(indent)) + "\n")
     for stat in stats:
         sent_recv = f"{stat.sent}/{stat.received}"
         success_pct = f"{stat.success_rate:.0f}%"
@@ -289,7 +291,9 @@ def display_results(stats: List[PingStats]) -> None:
         row = f"{indent}{stat.address:<35}{sent_recv:<12}{success_pct:<12}{latency:<14}"
         if stat.sent > 0:
             row = colorize(row, stat.last_success)
-        print(row)
+        buffer.append(row + "\n")
+    sys.stdout.write("".join(buffer))
+    sys.stdout.flush()
 
 
 async def monitor_addresses(addresses: List[str]) -> None:
@@ -297,7 +301,7 @@ async def monitor_addresses(addresses: List[str]) -> None:
     ordered_stats = [stats[addr] for addr in addresses]
     listener = EscapeListener()
     listener.start()
-    display_results(ordered_stats)
+    display_results(ordered_stats, initial=True)
     stopped_by_escape = False
     try:
         while True:
