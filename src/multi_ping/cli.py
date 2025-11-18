@@ -8,11 +8,17 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 MAX_TARGETS = 20
+WINDOW_SIZE = 5
+DEFAULT_DELAY = 0.5
+MIN_DELAY = 0.25
+MAX_DELAY = 2.5
+DELAY_STEP = 0.25
 IP_LIKE_PATTERN = re.compile(r"^[0-9A-Fa-f:.]+$")
 LATENCY_PATTERN = re.compile(r"time[=<]\s*([0-9.]+)\s*ms", re.IGNORECASE)
 WINDOWS_AVG_PATTERN = re.compile(r"Average = ([0-9]+)ms", re.IGNORECASE)
@@ -59,12 +65,22 @@ class PingStats:
         return (self.received / self.sent) * 100
 
 
+@dataclass
+class DelayController:
+    value: float = DEFAULT_DELAY
+
+    def adjust(self, delta: float) -> None:
+        self.value = max(MIN_DELAY, min(MAX_DELAY, self.value + delta))
+
+
 class EscapeListener:
     def __init__(self) -> None:
         self._stop = threading.Event()
-        self._pressed = threading.Event()
+        self._escape_pressed = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._supported = sys.stdin.isatty()
+        self._adjustments: Deque[int] = deque()
+        self._adjust_lock = threading.Lock()
 
     def start(self) -> None:
         if not self._supported:
@@ -81,7 +97,13 @@ class EscapeListener:
 
     @property
     def pressed(self) -> bool:
-        return self._pressed.is_set()
+        return self._escape_pressed.is_set()
+
+    def consume_adjustment(self) -> Optional[int]:
+        with self._adjust_lock:
+            if self._adjustments:
+                return self._adjustments.popleft()
+            return None
 
     def _run(self) -> None:
         if os.name == "nt":
@@ -97,8 +119,7 @@ class EscapeListener:
         while not self._stop.is_set():
             if msvcrt.kbhit():
                 key = msvcrt.getch()
-                if key == b"\x1b":
-                    self._pressed.set()
+                if self._handle_key(key):
                     break
             time.sleep(0.05)
 
@@ -124,11 +145,25 @@ class EscapeListener:
                     ch = os.read(fd, 1)
                 except OSError:
                     break
-                if ch == b"\x1b":
-                    self._pressed.set()
+                if self._handle_key(ch):
                     break
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def _handle_key(self, key: bytes) -> bool:
+        if key == b"\x1b":
+            self._escape_pressed.set()
+            self._stop.set()
+            return True
+        if key == b"+":
+            self._queue_adjustment(1)
+        elif key in (b"-", b"_"):
+            self._queue_adjustment(-1)
+        return False
+
+    def _queue_adjustment(self, direction: int) -> None:
+        with self._adjust_lock:
+            self._adjustments.append(direction)
 
 
 def prompt_addresses() -> List[str]:
@@ -277,13 +312,18 @@ def colorize_text(text: str, color: str) -> str:
     return f"{color}{text}{COLOR_RESET}"
 
 
-def display_results(stats: List[PingStats], *, initial: bool = False) -> None:
+def display_results(
+    stats: List[PingStats], delay_seconds: float, *, initial: bool = False
+) -> None:
     indent = " " * 5
     header = f"{indent}{'Address':<35}{'Sent/Recv':<12}{'Success %':<12}{'Latency (ms)':<14}"
     buffer: List[str] = []
     if sys.stdout.isatty():
         buffer.append(CLEAR_SCREEN if initial else CURSOR_HOME)
-    buffer.append(f"{indent}Press 'Esc' to exit monitoring.\n\n")
+    buffer.append(
+        f"{indent}Press 'Esc' to exit monitoring. Use '+'/'-' to adjust delay.\n"
+    )
+    buffer.append(f"{indent}Current delay: {delay_seconds:.2f}s\n\n")
     buffer.append(header + "\n")
     buffer.append(indent + "-" * (len(header) - len(indent)) + "\n")
     for stat in stats:
@@ -303,39 +343,82 @@ async def monitor_addresses(addresses: List[str]) -> None:
     ordered_stats = [stats[addr] for addr in addresses]
     listener = EscapeListener()
     listener.start()
-    display_results(ordered_stats, initial=True)
+    delay_controller = DelayController()
+    display_results(ordered_stats, delay_controller.value, initial=True)
+    semaphore = asyncio.Semaphore(WINDOW_SIZE)
+    display_lock = asyncio.Lock()
+    stop_event = asyncio.Event()
     stopped_by_escape = False
+
+    workers = [
+        asyncio.create_task(
+            ping_worker(
+                addr,
+                stats[addr],
+                ordered_stats,
+                semaphore,
+                display_lock,
+                stop_event,
+                delay_controller,
+            )
+        )
+        for addr in addresses
+    ]
+
     try:
-        while True:
-            stop_requested = False
-            for addr in addresses:
-                if listener.pressed:
-                    stop_requested = True
-                    stopped_by_escape = True
+        while not stop_event.is_set():
+            adjusted = False
+            while True:
+                adjustment = listener.consume_adjustment()
+                if adjustment is None:
                     break
-                stat = stats[addr]
-                stat.sent += 1
-                result = await ping_target(addr)
-                stat.received += result.received
-                stat.latency_ms = result.latency_ms
-                stat.last_success = result.success
-                display_results(ordered_stats)
-                if listener.pressed:
-                    stop_requested = True
-                    stopped_by_escape = True
-                    break
-            if stop_requested:
+                delay_controller.adjust(adjustment * DELAY_STEP)
+                adjusted = True
+            if adjusted:
+                async with display_lock:
+                    display_results(ordered_stats, delay_controller.value)
+            if listener.pressed:
+                stopped_by_escape = True
+                stop_event.set()
                 break
+            await asyncio.sleep(0.1)
     except KeyboardInterrupt:
         print("\nStopping monitoring (Ctrl+C detected).")
+        stop_event.set()
     finally:
         listener.stop()
+    await asyncio.gather(*workers, return_exceptions=True)
     if stopped_by_escape:
         print("\nEsc pressed. Stopping monitoring. Goodbye!")
         try:
             input("Press Enter to exit...")
         except EOFError:
             pass
+
+
+async def ping_worker(
+    address: str,
+    stat: PingStats,
+    ordered_stats: List[PingStats],
+    semaphore: asyncio.Semaphore,
+    display_lock: asyncio.Lock,
+    stop_event: asyncio.Event,
+    delay_controller: DelayController,
+) -> None:
+    while not stop_event.is_set():
+        async with semaphore:
+            if stop_event.is_set():
+                break
+            stat.sent += 1
+            result = await ping_target(address)
+        stat.received += result.received
+        stat.latency_ms = result.latency_ms
+        stat.last_success = result.success
+        async with display_lock:
+            display_results(ordered_stats, delay_controller.value)
+        if stop_event.is_set():
+            break
+        await asyncio.sleep(delay_controller.value)
 
 
 def main() -> None:
